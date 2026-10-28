@@ -3,4 +3,6 @@ chromadb>=0.5
 google-genai>=1.0
 python-dotenv>=1.0
 langchain-text-splitters>=0.2
-streamlit>=1.35
+fastapi>=0.111
+uvicorn>=0.29
+python-multipart>=0.0.9
