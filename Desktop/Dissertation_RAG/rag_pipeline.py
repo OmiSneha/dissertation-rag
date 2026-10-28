@@ -1,78 +1,88 @@
 """
 rag_pipeline.py
----------------
-Document-based RAG pipeline:
-  1. Ingest a PDF (extract, chunk, embed, store in ChromaDB)
-  2. Query: embed question → retrieve chunks via cosine similarity
-  3. Retrieval-adequacy check: abstain when evidence is insufficient
-  4. Answer generation via Google Gemini API (context-only prompt)
+----------------
+Core RAG pipeline functions (no UI logic here).
+
+Steps
+-----
+1. ingest_document(pdf_bytes, filename)
+   - Extract text from PDF bytes
+   - Split into overlapping chunks
+   - Embed each chunk with Gemini embedding model
+   - Store in ChromaDB (persistent, per-document collection)
+
+2. query(question, collection_name)
+   - Embed the question
+   - Retrieve top-K chunks by cosine similarity (L2 distance)
+   - Retrieval-adequacy check against threshold
+     * distance < THRESHOLD  →  evidence is adequate  →  generate answer
+     * distance >= THRESHOLD →  evidence is insufficient → abstain
+   - If adequate: send question + context to Gemini, return answer
+   - Return a result dict with all intermediate data for display in UI
+
+ChromaDB L2 distance notes
+---------------------------
+ChromaDB's default metric is L2 (squared Euclidean).
+For normalised unit vectors the relationship to cosine similarity is:
+    L2² = 2(1 - cosine_similarity)
+So L2 = 0 means identical, L2 = √2 ≈ 1.41 means orthogonal.
+A threshold of 0.9 (from the working reference project) corresponds to
+roughly cosine_similarity > 0.595, which is a reasonable "related" cut-off.
 """
 
+import hashlib
+import io
 import os
-import uuid
-from pathlib import Path
-from typing import Optional
 
-from dotenv import load_dotenv
-from pypdf import PdfReader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 import chromadb
+from dotenv import load_dotenv
 from google import genai
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pypdf import PdfReader
 
 load_dotenv()
 
-# ── constants ──────────────────────────────────────────────────────────────────
-CHROMA_PATH = "./chroma_db"
-COLLECTION_NAME = "dissertation_docs"
-EMBEDDING_MODEL = "gemini-embedding-001"
-GENERATION_MODEL = "gemini-2.0-flash"
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 100
-TOP_K = 3
-# ChromaDB returns L2 distances; a lower value means more similar.
-# 1.0 is a practical cutoff for "context is too weak to trust".
-ADEQUACY_THRESHOLD = 1.0
+# ── configuration ──────────────────────────────────────────────────────────────
+CHROMA_DB_PATH   = "./chroma_db"
+EMBED_MODEL      = "gemini-embedding-001"
+GENERATE_MODEL   = "gemini-3.8-flash"
+CHUNK_SIZE       = 500
+CHUNK_OVERLAP    = 100
+TOP_K            = 3
+
+# L2 distance threshold.
+# Chunks with distance BELOW this are considered adequate evidence.
+# Chunks with distance AT OR ABOVE this are considered too weak.
+ADEQUACY_THRESHOLD = 0.9
 
 
-# ── clients (lazy-initialised) ─────────────────────────────────────────────────
-_gemini_client: Optional[genai.Client] = None
-_chroma_client: Optional[chromadb.PersistentClient] = None
-_collection = None
+# ── Gemini client (lazy) ───────────────────────────────────────────────────────
+_client: genai.Client | None = None
+
+def _gemini() -> genai.Client:
+    global _client
+    if _client is None:
+        key = os.getenv("GEMINI_API_KEY")
+        if not key:
+            raise EnvironmentError(
+                "GEMINI_API_KEY is not set. Add it to your .env file."
+            )
+        _client = genai.Client(api_key=key)
+    return _client
 
 
-def _get_gemini() -> genai.Client:
-    global _gemini_client
-    if _gemini_client is None:
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise EnvironmentError("GEMINI_API_KEY not set in .env")
-        _gemini_client = genai.Client(api_key=api_key)
-    return _gemini_client
-
-
-def _get_collection():
-    global _chroma_client, _collection
-    if _collection is None:
-        _chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
-        _collection = _chroma_client.get_or_create_collection(
-            name=COLLECTION_NAME,
-            metadata={"hnsw:space": "l2"},
-        )
-    return _collection
-
-
-# ── ingestion ──────────────────────────────────────────────────────────────────
-def ingest_pdf(pdf_path: str) -> int:
+# ── step 1: ingest ─────────────────────────────────────────────────────────────
+def ingest_document(pdf_bytes: bytes, filename: str) -> dict:
     """
-    Extract text from a PDF, split into chunks, embed with Gemini,
-    store in ChromaDB.  Returns the number of chunks stored.
+    Ingest a PDF (supplied as raw bytes).
+    Returns { collection_name, num_chunks, preview_chunks }.
     """
-    path = Path(pdf_path)
-    if not path.exists():
-        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+    # Derive a stable collection name from the filename
+    safe_name = "".join(c if c.isalnum() else "_" for c in filename.replace(".pdf", ""))
+    collection_name = f"doc_{safe_name[:40]}"
 
-    # 1. Extract text
-    reader = PdfReader(str(path))
+    # 1a. Extract text
+    reader = PdfReader(io.BytesIO(pdf_bytes))
     raw_text = ""
     for page in reader.pages:
         page_text = page.extract_text()
@@ -80,115 +90,115 @@ def ingest_pdf(pdf_path: str) -> int:
             raw_text += page_text + "\n"
 
     if not raw_text.strip():
-        raise ValueError("No text could be extracted from the PDF.")
+        raise ValueError("No text could be extracted from the uploaded PDF.")
 
-    # 2. Chunk
+    # 1b. Chunk
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
         separators=["\n\n", "\n", " ", ""],
     )
     chunks = splitter.split_text(raw_text)
-    print(f"[ingest] Extracted {len(raw_text):,} chars → {len(chunks)} chunks")
 
-    # 3. Embed
-    client = _get_gemini()
+    # 1c. Embed
+    client = _gemini()
     embeddings = []
     for chunk in chunks:
-        resp = client.models.embed_content(model=EMBEDDING_MODEL, contents=chunk)
+        resp = client.models.embed_content(model=EMBED_MODEL, contents=chunk)
         embeddings.append(resp.embeddings[0].values)
 
-    # 4. Store
-    collection = _get_collection()
-    doc_prefix = path.stem[:20]
-    ids = [f"{doc_prefix}_{uuid.uuid4().hex[:8]}" for _ in chunks]
+    # 1d. Store in ChromaDB (delete+recreate so re-upload is clean)
+    chroma = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+    existing = [c.name for c in chroma.list_collections()]
+    if collection_name in existing:
+        chroma.delete_collection(collection_name)
 
+    collection = chroma.get_or_create_collection(
+        name=collection_name,
+        metadata={"hnsw:space": "l2"},
+    )
+    ids = [f"chunk_{i}" for i in range(len(chunks))]
     collection.add(ids=ids, documents=chunks, embeddings=embeddings)
-    print(f"[ingest] Stored {len(chunks)} chunks in ChromaDB (total: {collection.count()})")
-    return len(chunks)
+
+    return {
+        "collection_name": collection_name,
+        "num_chunks": len(chunks),
+        "preview_chunks": chunks[:3],
+    }
 
 
-# ── retrieval ──────────────────────────────────────────────────────────────────
-def retrieve(question: str) -> tuple[list[str], list[float]]:
+# ── step 2: query ──────────────────────────────────────────────────────────────
+def query(question: str, collection_name: str) -> dict:
     """
-    Embed the question and return (chunks, distances) for the top-K results.
-    Distances are L2; smaller = more similar.
+    Ask a question against an ingested document collection.
+
+    Returns a dict with:
+        adequate      bool   – whether evidence passed the threshold
+        answer        str    – generated answer (or abstention message)
+        chunks        list   – retrieved chunk texts
+        distances     list   – L2 distances for each retrieved chunk
+        threshold     float  – the configured ADEQUACY_THRESHOLD
+        best_distance float  – lowest (best) distance found
     """
-    client = _get_gemini()
-    resp = client.models.embed_content(model=EMBEDDING_MODEL, contents=question)
+    client = _gemini()
+    chroma  = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+    collection = chroma.get_collection(name=collection_name)
+
+    # 2a. Embed the question
+    resp = client.models.embed_content(model=EMBED_MODEL, contents=question)
     q_embedding = resp.embeddings[0].values
 
-    collection = _get_collection()
+    # 2b. Retrieve top-K chunks by L2 distance
+    n = min(TOP_K, collection.count())
     results = collection.query(
         query_embeddings=[q_embedding],
-        n_results=min(TOP_K, collection.count()),
+        n_results=n,
         include=["documents", "distances"],
     )
-    return results["documents"][0], results["distances"][0]
+    chunks    = results["documents"][0]
+    distances = results["distances"][0]
+    best_dist = distances[0] if distances else float("inf")
 
+    # 2c. Retrieval-adequacy check
+    #     distance < threshold  →  adequate
+    #     distance >= threshold →  abstain
+    if best_dist >= ADEQUACY_THRESHOLD:
+        return {
+            "adequate":      False,
+            "answer":        (
+                "I cannot provide a reliable answer. "
+                "The retrieved context does not contain sufficient evidence "
+                f"for this question (best similarity distance: {best_dist:.4f}, "
+                f"threshold: {ADEQUACY_THRESHOLD})."
+            ),
+            "chunks":        chunks,
+            "distances":     distances,
+            "threshold":     ADEQUACY_THRESHOLD,
+            "best_distance": best_dist,
+        }
 
-# ── adequacy check ─────────────────────────────────────────────────────────────
-def is_evidence_adequate(distances: list[float]) -> bool:
-    """
-    Return True when the best (lowest-L2) chunk distance is below the
-    ADEQUACY_THRESHOLD, indicating sufficient evidence.
-    """
-    if not distances:
-        return False
-    return distances[0] < ADEQUACY_THRESHOLD
-
-
-# ── answer generation ──────────────────────────────────────────────────────────
-def generate_answer(question: str, context: str) -> str:
-    """
-    Ask Gemini to answer the question using only the supplied context.
-    """
-    prompt = f"""You are a helpful assistant. Answer the question using ONLY the information
-provided in the context below. Do not add information from outside the context.
-If the answer cannot be found in the context, say exactly:
-"I could not find a supported answer in the retrieved context."
+    # 2d. Generate answer via Gemini (context-only prompt)
+    context = "\n\n---\n\n".join(chunks)
+    prompt = f"""You are a helpful assistant. Answer the question using ONLY the \
+information in the context below. Do not use any outside knowledge.
+If the answer is not in the context, say: \
+"I could not find the answer in the provided document."
 
 Context:
-------------------------------------------------------------
 {context}
-------------------------------------------------------------
 
 Question: {question}
 
 Answer:"""
 
-    client = _get_gemini()
-    response = client.models.generate_content(model=GENERATION_MODEL, contents=prompt)
-    return response.text.strip()
-
-
-# ── main RAG call ──────────────────────────────────────────────────────────────
-def ask(question: str) -> dict:
-    """
-    Full RAG pipeline for a single question.
-
-    Returns a dict with:
-      question, retrieved_chunks, distances, adequate, answer
-    """
-    chunks, distances = retrieve(question)
-    adequate = is_evidence_adequate(distances)
-
-    if not adequate:
-        return {
-            "question": question,
-            "retrieved_chunks": chunks,
-            "distances": distances,
-            "adequate": False,
-            "answer": "I cannot answer reliably: the retrieved context does not contain sufficient evidence.",
-        }
-
-    context = "\n\n".join(chunks)
-    answer = generate_answer(question, context)
+    gen_resp = client.models.generate_content(model=GENERATE_MODEL, contents=prompt)
+    answer   = gen_resp.text.strip()
 
     return {
-        "question": question,
-        "retrieved_chunks": chunks,
-        "distances": distances,
-        "adequate": True,
-        "answer": answer,
+        "adequate":      True,
+        "answer":        answer,
+        "chunks":        chunks,
+        "distances":     distances,
+        "threshold":     ADEQUACY_THRESHOLD,
+        "best_distance": best_dist,
     }
